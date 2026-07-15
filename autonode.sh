@@ -11,9 +11,20 @@ fi
 echo "Обновление пакетов и установка базовых утилит..."
 apt update && apt install -y curl sudo ufw
 
+# Функция для предотвращения дублирования записей в sysctl.conf
+add_to_sysctl() {
+    local key="$1"
+    local value="$2"
+    if grep -q "^${key}" /etc/sysctl.conf; then
+        sed -i "s|^${key}.*|${key} = ${value}|" /etc/sysctl.conf
+    else
+        echo "${key} = ${value}" >> /etc/sysctl.conf
+    fi
+}
+
 echo "Активация bbr..."
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+add_to_sysctl "net.core.default_qdisc" "fq"
+add_to_sysctl "net.ipv4.tcp_congestion_control" "bbr"
 sysctl -p
 
 # Отключение IPv6
@@ -21,11 +32,9 @@ read -p "Отключить IPv6? (y/n) [по умолчанию y]: " DISABLE_I
 DISABLE_IPV6=${DISABLE_IPV6:-y}
 
 if [ "$DISABLE_IPV6" = "y" ]; then
-    cat >> /etc/sysctl.conf << EOF
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOF
+    add_to_sysctl "net.ipv6.conf.all.disable_ipv6" "1"
+    add_to_sysctl "net.ipv6.conf.default.disable_ipv6" "1"
+    add_to_sysctl "net.ipv6.conf.lo.disable_ipv6" "1"
     sysctl -p
     echo "IPv6 отключён."
 else
@@ -88,7 +97,7 @@ if [ -n "$PUB_KEY" ]; then
             chown -R "$USERNAME:$USERNAME" "$SSH_DIR"
             echo "Публичный ключ успешно добавлен."
 
-            # Отключаем пароли, раз ключ успешно добавлен
+            # Отключаем пароли, если ключ успешно добавлен
             sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD"
             sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSHD"
 
@@ -120,8 +129,8 @@ validate_port() {
     echo "$1" | grep -Eq '^[0-9]+$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-# Спрашиваем про ограничение SSH по IP
-read -p "Ограничить доступ к SSH (порт 22) только для вашего текущего IP? (y/n) [по умолчанию n, безопасно]: " RESTRICT_SSH
+# Ограничение SSH по IP
+read -p "Ограничить доступ к SSH (порт 22) только для вашего текущего IP? (y/n) [по умолчанию n]: " RESTRICT_SSH
 RESTRICT_SSH=${RESTRICT_SSH:-n}
 
 if [ "$RESTRICT_SSH" = "y" ]; then
@@ -141,6 +150,12 @@ else
     ufw allow 22/tcp comment "SSH"
 fi
 
+# Автоматическое определение IP сервера
+SERVER_IP=$(hostname -I | tr ' ' '\n' | grep -Ev ':' | head -1)
+echo "IP сервера: $SERVER_IP"
+
+# Добавление твоего правила блокировки подсети сервера /22 на первое место в таблице UFW
+ufw insert 1 deny from "$SERVER_IP/22"
 ufw allow 443 comment "HTTPS"
 
 # Запрос IP панели управления
@@ -206,6 +221,39 @@ bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode
 # Установка WARP
 echo "Установка Cloudflare WARP..."
 bash <(curl -sL https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh) install-warp
+
+# Автоматический вынос и монтирование SSL сертификатов
+read -p "Вынести SSL сертификаты из контейнера и примонтировать к ноде? (y/n) [По умолчанию n]: " SSL
+SSL=${SSL:-n}
+
+if [ "$SSL" = "y" ]; then
+    echo "Выполняется автоматическая настройка томов и путей..."
+
+    # 1. Изменение путей в Caddy
+    CADDY_COMPOSE="/opt/caddy/docker-compose.yml"
+    if [ -f "$CADDY_COMPOSE" ]; then
+        sed -i 's|caddy_data:data|./caddy_data:data|g' "$CADDY_COMPOSE"
+        sed -i 's|caddy_data:/data|./caddy_data:/data|g' "$CADDY_COMPOSE"
+        echo "Файл $CADDY_COMPOSE успешно обновлен."
+        cd /opt/caddy && docker compose down && docker compose up -d
+    else
+        echo "⚠️ Файл $CADDY_COMPOSE не найден. Пропускаем этот шаг."
+    fi
+
+    # 2. Добавление тома в Remnanode
+    NODE_COMPOSE="/opt/remnanode/docker-compose.yml"
+    if [ -f "$NODE_COMPOSE" ]; then
+        if ! grep -q "acme-v02.api.letsencrypt.org" "$NODE_COMPOSE"; then
+            sed -i '0,/volumes:/ s|volumes:|volumes:\n      - /opt/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory:/etc/xray/certs:ro|' "$NODE_COMPOSE"
+            echo "Файл $NODE_COMPOSE успешно обновлен."
+            cd /opt/remnanode && docker compose down && docker compose up -d
+        else
+            echo "Сертификаты уже примонтированы в $NODE_COMPOSE."
+        fi
+    else
+        echo "⚠️ Файл $NODE_COMPOSE не найден. Пропускаем этот шаг."
+    fi
+fi
 
 echo "🎉 Настройка сервера успешно завершена!"
 exit 0
