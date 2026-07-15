@@ -154,7 +154,6 @@ fi
 SERVER_IP=$(hostname -I | tr ' ' '\n' | grep -Ev ':' | head -1)
 echo "IP сервера: $SERVER_IP"
 
-# Добавление твоего правила блокировки подсети сервера /22 на первое место в таблице UFW
 ufw insert 1 deny from "$SERVER_IP/22"
 ufw allow 443 comment "HTTPS"
 
