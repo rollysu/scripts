@@ -9,7 +9,7 @@ CONFIG_DIR="/etc/mihomo"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 SERVICE_FILE="/etc/systemd/system/mihomo.service"
 CRON_COMMENT="# mihomo-subscription-update"
-USER_AGENT="chlenix"
+USER_AGENT="clash.meta"
 
 MIRRORS=(
     ""
