@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 set -euo pipefail
 
 REPO="MetaCubeX/mihomo"
@@ -8,6 +10,16 @@ CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 SERVICE_FILE="/etc/systemd/system/mihomo.service"
 CRON_COMMENT="# mihomo-subscription-update"
 USER_AGENT="chlenix"
+
+MIRRORS=(
+    ""
+    "https://ghfast.top/"
+    "https://gh-proxy.com/"
+    "https://ghproxy.net/"
+    "https://mirror.ghproxy.com/"
+)
+
+CURL_OPTS=(--connect-timeout 8 --max-time 30 --retry 1 --retry-delay 1)
 
 if [[ "${EUID}" -ne 0 ]]; then
     echo "Ошибка: скрипт нужно запускать от root (используйте sudo)." >&2
@@ -136,24 +148,59 @@ esac
 
 echo "==> Обнаружена архитектура: ${ARCH_RAW} -> ${ARCH}"
 
+WORKING_MIRROR=""
+fetch_via_mirrors() {
+    local real_url="$1"
+    local out_file="$2"
+    local mirror http_code label
+
+    for mirror in "${MIRRORS[@]}"; do
+        label="${mirror:-(прямое подключение)}"
+        echo "==> Пробую ${label} ..." >&2
+
+        http_code="$(curl -sSL "${CURL_OPTS[@]}" \
+            -H "Accept: application/vnd.github+json" \
+            -w "%{http_code}" \
+            -o "${out_file}" \
+            "${mirror}${real_url}" 2>/dev/null || echo "000")"
+
+        if [[ "${http_code}" == "200" ]]; then
+            WORKING_MIRROR="${mirror}"
+            echo "==> Успешно через ${label} (HTTP ${http_code})" >&2
+            return 0
+        else
+            echo "    Не удалось (HTTP ${http_code:-нет ответа})." >&2
+        fi
+    done
+
+    return 1
+}
+
 echo "==> Запрашиваю информацию о последнем релизе ${REPO}..."
 
-# Скачиваем без -f, чтобы перехватить ответ, и предотвращаем аварийное завершение set -e
-RELEASE_JSON="$(curl -sSL -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/releases/latest" || true)"
-
-# Проверяем, содержатся ли в ответе данные или сообщение об ошибке
-if echo "${RELEASE_JSON}" | grep -q "message"; then
-    ERR_MSG="$(echo "${RELEASE_JSON}" | grep -o '"message":\s*"[^"]*"' | head -n1)"
-    echo "Ошибка GitHub API: ${ERR_MSG:-Неизвестная ошибка}" >&2
-    echo "Возможно, превышен лимит запросов (Rate Limit). Подождите несколько минут или укажите версию вручную." >&2
+RELEASE_JSON_FILE="$(mktemp)"
+if ! fetch_via_mirrors "https://api.github.com/repos/${REPO}/releases/latest" "${RELEASE_JSON_FILE}"; then
+    echo "Ошибка: не удалось получить данные о релизе ни напрямую, ни через зеркала." >&2
+    echo "Проверьте доступ в интернет, DNS и настройки прокси/файрвола на этой машине." >&2
+    echo "Ручная проверка: curl -v https://api.github.com/repos/${REPO}/releases/latest" >&2
+    rm -f "${RELEASE_JSON_FILE}"
     exit 1
 fi
 
-TAG_NAME="$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')"
+RELEASE_JSON="$(cat "${RELEASE_JSON_FILE}")"
+rm -f "${RELEASE_JSON_FILE}"
+
+if echo "${RELEASE_JSON}" | grep -q '"message"'; then
+    ERR_MSG="$(echo "${RELEASE_JSON}" | grep -o '"message":[[:space:]]*"[^"]*"' | head -n1)"
+    echo "Ошибка GitHub API: ${ERR_MSG:-неизвестная ошибка}" >&2
+    echo "Возможно, превышен лимит запросов (rate limit). Подождите или используйте другую сеть/зеркало." >&2
+    exit 1
+fi
+
+TAG_NAME="$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
 
 if [[ -z "${TAG_NAME}" ]]; then
-    echo "Ошибка: не удалось определить тег последнего релиза." >&2
+    echo "Ошибка: не удалось определить тег последнего релиза (пустой или неожиданный ответ API)." >&2
     exit 1
 fi
 
@@ -162,7 +209,7 @@ echo "==> Последний релиз: ${TAG_NAME}"
 ASSET_NAME_PATTERN="mihomo-linux-${ARCH}-${TAG_NAME}.gz"
 
 DOWNLOAD_URL="$(echo "${RELEASE_JSON}" \
-    | grep -o "\"browser_download_url\":\s*\"[^\"]*${ASSET_NAME_PATTERN}\"" \
+    | grep -o "\"browser_download_url\":[[:space:]]*\"[^\"]*${ASSET_NAME_PATTERN}\"" \
     | head -n1 \
     | sed -E 's/.*"(https:[^"]+)"/\1/')"
 
@@ -180,8 +227,15 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 TMP_GZ="${TMP_DIR}/${BIN_NAME}.gz"
 TMP_BIN="${TMP_DIR}/${BIN_NAME}"
 
-echo "==> Скачиваю..."
-curl -fsSL -o "${TMP_GZ}" "${DOWNLOAD_URL}"
+echo "==> Скачиваю бинарник..."
+if [[ -n "${WORKING_MIRROR}" ]]; then
+    MIRRORS=("${WORKING_MIRROR}" "${MIRRORS[@]}")
+fi
+
+if ! fetch_via_mirrors "${DOWNLOAD_URL}" "${TMP_GZ}"; then
+    echo "Ошибка: не удалось скачать бинарник mihomo ни напрямую, ни через зеркала." >&2
+    exit 1
+fi
 
 echo "==> Распаковываю..."
 gzip -d -c "${TMP_GZ}" > "${TMP_BIN}"
@@ -217,13 +271,12 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=${INSTALL_DIR}/${BIN_NAME} -d ${CONFIG_DIR}
-ExecReload=/bin/kill -HUP $MAINPID
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_TIME CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRID
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_TIME CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_TIME CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
-
 
 [Install]
 WantedBy=multi-user.target
