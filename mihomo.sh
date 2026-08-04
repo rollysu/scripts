@@ -1,0 +1,241 @@
+set -euo pipefail
+
+REPO="MetaCubeX/mihomo"
+INSTALL_DIR="/usr/local/bin"
+BIN_NAME="mihomo"
+CONFIG_DIR="/etc/mihomo"
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+SERVICE_FILE="/etc/systemd/system/mihomo.service"
+CRON_COMMENT="# mihomo-subscription-update"
+USER_AGENT="chlenix"
+
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "Ошибка: скрипт нужно запускать от root (используйте sudo)." >&2
+    exit 1
+fi
+
+PKG_MANAGER=""
+if command -v apt-get &>/dev/null; then
+    PKG_MANAGER="apt"
+elif command -v dnf &>/dev/null; then
+    PKG_MANAGER="dnf"
+elif command -v yum &>/dev/null; then
+    PKG_MANAGER="yum"
+elif command -v pacman &>/dev/null; then
+    PKG_MANAGER="pacman"
+elif command -v zypper &>/dev/null; then
+    PKG_MANAGER="zypper"
+elif command -v apk &>/dev/null; then
+    PKG_MANAGER="apk"
+fi
+
+pkg_name_for() {
+    local cmd="$1"
+    case "${cmd}" in
+        crontab)
+            case "${PKG_MANAGER}" in
+                apt)    echo "cron" ;;
+                dnf|yum) echo "cronie" ;;
+                pacman) echo "cronie" ;;
+                zypper) echo "cronie" ;;
+                apk)    echo "cronie" ;;
+            esac
+            ;;
+        *)
+            echo "${cmd}"
+            ;;
+    esac
+}
+
+install_pkg() {
+    local pkg="$1"
+    echo "==> Устанавливаю пакет '${pkg}' (${PKG_MANAGER})..."
+    case "${PKG_MANAGER}" in
+        apt)
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkg}"
+            ;;
+        dnf)
+            dnf install -y "${pkg}"
+            ;;
+        yum)
+            yum install -y "${pkg}"
+            ;;
+        pacman)
+            pacman -Sy --noconfirm "${pkg}"
+            ;;
+        zypper)
+            zypper install -y "${pkg}"
+            ;;
+        apk)
+            apk add --no-cache "${pkg}"
+            ;;
+        *)
+            echo "Ошибка: не удалось определить пакетный менеджер, установите '${pkg}' вручную." >&2
+            exit 1
+            ;;
+    esac
+}
+
+if ! command -v systemctl &>/dev/null; then
+    echo "Ошибка: не найден systemctl. В этой системе не используется systemd, автоматическая установка невозможна." >&2
+    exit 1
+fi
+
+for cmd in curl gzip install crontab; do
+    if ! command -v "${cmd}" &>/dev/null; then
+        pkg="$(pkg_name_for "${cmd}")"
+        if [[ -z "${pkg}" || -z "${PKG_MANAGER}" ]]; then
+            echo "Ошибка: не найдена утилита '${cmd}', и не удалось определить, каким пакетом её поставить." >&2
+            echo "Установите её вручную и запустите скрипт снова." >&2
+            exit 1
+        fi
+        install_pkg "${pkg}"
+    fi
+done
+
+if command -v crontab &>/dev/null; then
+    for svc in cron crond cronie; do
+        if systemctl list-unit-files "${svc}.service" &>/dev/null 2>&1 \
+            && systemctl list-unit-files "${svc}.service" | grep -q "${svc}.service"; then
+            systemctl enable --now "${svc}" &>/dev/null || true
+            break
+        fi
+    done
+fi
+
+for cmd in curl gzip install systemctl crontab; do
+    if ! command -v "${cmd}" &>/dev/null; then
+        echo "Ошибка: не удалось установить '${cmd}' автоматически. Установите вручную." >&2
+        exit 1
+    fi
+done
+
+ARCH_RAW="$(uname -m)"
+case "${ARCH_RAW}" in
+    x86_64|amd64)
+        ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        ARCH="arm64"
+        ;;
+    armv7l|armv7)
+        ARCH="armv7"
+        ;;
+    armv6l)
+        ARCH="armv6"
+        ;;
+    i386|i686)
+        ARCH="386"
+        ;;
+    *)
+        echo "Ошибка: неподдерживаемая архитектура '${ARCH_RAW}'." >&2
+        exit 1
+        ;;
+esac
+
+echo "==> Обнаружена архитектура: ${ARCH_RAW} -> ${ARCH}"
+
+echo "==> Запрашиваю информацию о последнем релизе ${REPO}..."
+RELEASE_JSON="$(curl -fsSL -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${REPO}/releases/latest")"
+
+TAG_NAME="$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')"
+
+if [[ -z "${TAG_NAME}" ]]; then
+    echo "Ошибка: не удалось определить тег последнего релиза." >&2
+    exit 1
+fi
+
+echo "==> Последний релиз: ${TAG_NAME}"
+
+ASSET_NAME_PATTERN="mihomo-linux-${ARCH}-${TAG_NAME}.gz"
+
+DOWNLOAD_URL="$(echo "${RELEASE_JSON}" \
+    | grep -o "\"browser_download_url\":\s*\"[^\"]*${ASSET_NAME_PATTERN}\"" \
+    | head -n1 \
+    | sed -E 's/.*"(https:[^"]+)"/\1/')"
+
+if [[ -z "${DOWNLOAD_URL}" ]]; then
+    echo "Ошибка: не удалось найти файл релиза для маски '${ASSET_NAME_PATTERN}'." >&2
+    echo "Проверьте вручную страницу релизов: https://github.com/${REPO}/releases" >&2
+    exit 1
+fi
+
+echo "==> Файл для загрузки: ${DOWNLOAD_URL}"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+TMP_GZ="${TMP_DIR}/${BIN_NAME}.gz"
+TMP_BIN="${TMP_DIR}/${BIN_NAME}"
+
+echo "==> Скачиваю..."
+curl -fsSL -o "${TMP_GZ}" "${DOWNLOAD_URL}"
+
+echo "==> Распаковываю..."
+gzip -d -c "${TMP_GZ}" > "${TMP_BIN}"
+chmod +x "${TMP_BIN}"
+
+echo "==> Устанавливаю в ${INSTALL_DIR}/${BIN_NAME}..."
+install -m 755 "${TMP_BIN}" "${INSTALL_DIR}/${BIN_NAME}"
+
+INSTALLED_VERSION="$("${INSTALL_DIR}/${BIN_NAME}" -v 2>/dev/null || true)"
+echo "==> Установлено: ${INSTALLED_VERSION:-${TAG_NAME}}"
+
+mkdir -p "${CONFIG_DIR}"
+
+SUBSCRIPTION_URL=""
+while [[ -z "${SUBSCRIPTION_URL}" ]]; do
+    read -r -p "Введите ссылку на подписку (URL конфига): " SUBSCRIPTION_URL
+    if [[ -z "${SUBSCRIPTION_URL}" ]]; then
+        echo "Ссылка не может быть пустой, попробуйте снова."
+    fi
+done
+
+echo "==> Скачиваю конфиг по подписке в ${CONFIG_FILE}..."
+if ! curl -s -L -A "${USER_AGENT}" "${SUBSCRIPTION_URL}" -o "${CONFIG_FILE}"; then
+    echo "Предупреждение: не удалось скачать конфиг сейчас. Cron-задача попробует позже." >&2
+fi
+
+echo "==> Создаю systemd-юнит ${SERVICE_FILE}..."
+cat > "${SERVICE_FILE}" <<EOF
+[Unit]
+Description=mihomo daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/${BIN_NAME} -d ${CONFIG_DIR}
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_TIME CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRID
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_TIME CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable mihomo
+systemctl restart mihomo || echo "Предупреждение: mihomo не запустился, проверьте конфиг." >&2
+
+# ---------- Cron-задача ----------
+CRON_LINE="0 4 * * * curl -s -L -A \"${USER_AGENT}\" \"${SUBSCRIPTION_URL}\" -o ${CONFIG_FILE} && sleep 3 && systemctl restart mihomo ${CRON_COMMENT}"
+
+echo "==> Настраиваю cron-задачу обновления подписки..."
+# Убираем старую задачу mihomo (если есть) и добавляем новую
+( crontab -l 2>/dev/null | grep -v "${CRON_COMMENT}" ; echo "${CRON_LINE}" ) | crontab -
+
+echo
+echo "==================================================="
+echo " Готово!"
+echo " mihomo версии: ${INSTALLED_VERSION:-${TAG_NAME}}"
+echo " Конфиг: ${CONFIG_FILE}"
+echo " Cron-задача (обновление в 04:00 каждый день):"
+echo "   ${CRON_LINE}"
+echo " Статус сервиса: systemctl status mihomo"
+echo "==================================================="
