@@ -148,6 +148,20 @@ esac
 
 echo "==> Обнаружена архитектура: ${ARCH_RAW} -> ${ARCH}"
 
+AMD64_LEVEL=""
+if [[ "${ARCH}" == "amd64" ]]; then
+    has_flag() { grep -qw "$1" /proc/cpuinfo 2>/dev/null; }
+
+    if has_flag avx2 && has_flag bmi1 && has_flag bmi2 && has_flag fma && has_flag movbe; then
+        AMD64_LEVEL="v3"
+    elif has_flag sse4_2 && has_flag popcnt; then
+        AMD64_LEVEL="v2"
+    else
+        AMD64_LEVEL="v1"
+    fi
+    echo "==> Поддерживаемый уровень микроархитектуры CPU: x86-64-${AMD64_LEVEL}"
+fi
+
 WORKING_MIRROR=""
 fetch_release_json() {
     local real_url="$1"
@@ -180,8 +194,6 @@ fetch_release_json() {
         fi
         echo "    Начало ответа: $(head -c 150 "${tmp_file}" 2>/dev/null | tr -d '\n\r')" >&2
 
-        # Если это ошибка GitHub API (rate limit и т.п.) — показываем её отдельно и явно,
-        # это не проблема сети/зеркала, дальше пробовать другие зеркала бессмысленно.
         if grep -q '"message"' "${tmp_file}" 2>/dev/null; then
             ERR_MSG="$(grep -o '"message":[[:space:]]*"[^"]*"' "${tmp_file}" | head -n1 || true)"
             echo "    Ответ GitHub API: ${ERR_MSG:-см. выше}" >&2
@@ -211,7 +223,11 @@ fi
 
 echo "==> Последний релиз: ${TAG_NAME}"
 
-ASSET_NAME_PATTERN="mihomo-linux-${ARCH}-${TAG_NAME}.gz"
+if [[ "${ARCH}" == "amd64" ]]; then
+    ASSET_NAME_PATTERN="mihomo-linux-amd64-${AMD64_LEVEL}-${TAG_NAME}.gz"
+else
+    ASSET_NAME_PATTERN="mihomo-linux-${ARCH}-${TAG_NAME}.gz"
+fi
 
 DOWNLOAD_URL="$( (echo "${RELEASE_JSON}" \
     | grep -o "\"browser_download_url\":[[:space:]]*\"[^\"]*${ASSET_NAME_PATTERN}\"" \
@@ -320,6 +336,7 @@ systemctl daemon-reload
 systemctl enable mihomo
 systemctl restart mihomo || echo "Предупреждение: mihomo не запустился, проверьте конфиг." >&2
 
+# ---------- Cron-задача ----------
 CRON_LINE="0 4 * * * curl -s -L -A \"${USER_AGENT}\" \"${SUBSCRIPTION_URL}\" -o ${CONFIG_FILE} && sleep 3 && systemctl restart mihomo ${CRON_COMMENT}"
 
 echo "==> Настраиваю cron-задачу обновления подписки..."
