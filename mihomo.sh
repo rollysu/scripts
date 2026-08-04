@@ -180,6 +180,8 @@ fetch_release_json() {
         fi
         echo "    Начало ответа: $(head -c 150 "${tmp_file}" 2>/dev/null | tr -d '\n\r')" >&2
 
+        # Если это ошибка GitHub API (rate limit и т.п.) — показываем её отдельно и явно,
+        # это не проблема сети/зеркала, дальше пробовать другие зеркала бессмысленно.
         if grep -q '"message"' "${tmp_file}" 2>/dev/null; then
             ERR_MSG="$(grep -o '"message":[[:space:]]*"[^"]*"' "${tmp_file}" | head -n1 || true)"
             echo "    Ответ GitHub API: ${ERR_MSG:-см. выше}" >&2
@@ -321,7 +323,14 @@ systemctl restart mihomo || echo "Предупреждение: mihomo не за
 CRON_LINE="0 4 * * * curl -s -L -A \"${USER_AGENT}\" \"${SUBSCRIPTION_URL}\" -o ${CONFIG_FILE} && sleep 3 && systemctl restart mihomo ${CRON_COMMENT}"
 
 echo "==> Настраиваю cron-задачу обновления подписки..."
-( crontab -l 2>/dev/null | grep -v "${CRON_COMMENT}" ; echo "${CRON_LINE}" ) | crontab -
+
+if { { crontab -l 2>/dev/null || true; } | grep -v "${CRON_COMMENT}" || true; echo "${CRON_LINE}"; } | crontab -; then
+    echo "==> Cron-задача успешно установлена."
+else
+    echo "Предупреждение: не удалось автоматически прописать crontab." >&2
+    echo "Добавьте вручную командой 'crontab -e' следующую строку:" >&2
+    echo "  ${CRON_LINE}" >&2
+fi
 
 echo
 echo "==================================================="
