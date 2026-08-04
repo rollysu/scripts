@@ -149,10 +149,11 @@ esac
 echo "==> Обнаружена архитектура: ${ARCH_RAW} -> ${ARCH}"
 
 WORKING_MIRROR=""
-fetch_via_mirrors() {
+fetch_release_json() {
     local real_url="$1"
-    local out_file="$2"
-    local mirror http_code label
+    local mirror label http_code tmp_file
+
+    tmp_file="$(mktemp)"
 
     for mirror in "${MIRRORS[@]}"; do
         label="${mirror:-(прямое подключение)}"
@@ -161,46 +162,48 @@ fetch_via_mirrors() {
         http_code="$(curl -sSL "${CURL_OPTS[@]}" \
             -H "Accept: application/vnd.github+json" \
             -w "%{http_code}" \
-            -o "${out_file}" \
+            -o "${tmp_file}" \
             "${mirror}${real_url}" 2>/dev/null || echo "000")"
 
-        if [[ "${http_code}" == "200" ]]; then
+        if [[ "${http_code}" == "200" ]] && grep -q '"tag_name"' "${tmp_file}" 2>/dev/null; then
             WORKING_MIRROR="${mirror}"
             echo "==> Успешно через ${label} (HTTP ${http_code})" >&2
+            cat "${tmp_file}"
+            rm -f "${tmp_file}"
             return 0
+        fi
+
+        if [[ "${http_code}" == "200" ]]; then
+            echo "    HTTP 200, но это не похоже на релиз GitHub (нет tag_name)." >&2
         else
             echo "    Не удалось (HTTP ${http_code:-нет ответа})." >&2
         fi
+        echo "    Начало ответа: $(head -c 150 "${tmp_file}" 2>/dev/null | tr -d '\n\r')" >&2
+
+        if grep -q '"message"' "${tmp_file}" 2>/dev/null; then
+            ERR_MSG="$(grep -o '"message":[[:space:]]*"[^"]*"' "${tmp_file}" | head -n1 || true)"
+            echo "    Ответ GitHub API: ${ERR_MSG:-см. выше}" >&2
+        fi
     done
 
+    rm -f "${tmp_file}"
     return 1
 }
 
 echo "==> Запрашиваю информацию о последнем релизе ${REPO}..."
 
-RELEASE_JSON_FILE="$(mktemp)"
-if ! fetch_via_mirrors "https://api.github.com/repos/${REPO}/releases/latest" "${RELEASE_JSON_FILE}"; then
-    echo "Ошибка: не удалось получить данные о релизе ни напрямую, ни через зеркала." >&2
-    echo "Проверьте доступ в интернет, DNS и настройки прокси/файрвола на этой машине." >&2
+if ! RELEASE_JSON="$(fetch_release_json "https://api.github.com/repos/${REPO}/releases/latest")"; then
+    echo "Ошибка: не удалось получить корректные данные о релизе ни напрямую, ни через зеркала." >&2
+    echo "Похоже, api.github.com недоступен или подменяется в вашей сети (см. 'Начало ответа' выше)." >&2
+    echo "Возможные причины: блокировка провайдером/DPI, отсутствие интернета, исчерпан rate limit GitHub API (60 запросов/час без токена)." >&2
     echo "Ручная проверка: curl -v https://api.github.com/repos/${REPO}/releases/latest" >&2
-    rm -f "${RELEASE_JSON_FILE}"
     exit 1
 fi
 
-RELEASE_JSON="$(cat "${RELEASE_JSON_FILE}")"
-rm -f "${RELEASE_JSON_FILE}"
-
-if echo "${RELEASE_JSON}" | grep -q '"message"'; then
-    ERR_MSG="$(echo "${RELEASE_JSON}" | grep -o '"message":[[:space:]]*"[^"]*"' | head -n1)"
-    echo "Ошибка GitHub API: ${ERR_MSG:-неизвестная ошибка}" >&2
-    echo "Возможно, превышен лимит запросов (rate limit). Подождите или используйте другую сеть/зеркало." >&2
-    exit 1
-fi
-
-TAG_NAME="$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
+TAG_NAME="$( (echo "${RELEASE_JSON}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/') || true )"
 
 if [[ -z "${TAG_NAME}" ]]; then
-    echo "Ошибка: не удалось определить тег последнего релиза (пустой или неожиданный ответ API)." >&2
+    echo "Ошибка: не удалось определить тег последнего релиза (неожиданный формат ответа)." >&2
     exit 1
 fi
 
@@ -208,10 +211,10 @@ echo "==> Последний релиз: ${TAG_NAME}"
 
 ASSET_NAME_PATTERN="mihomo-linux-${ARCH}-${TAG_NAME}.gz"
 
-DOWNLOAD_URL="$(echo "${RELEASE_JSON}" \
+DOWNLOAD_URL="$( (echo "${RELEASE_JSON}" \
     | grep -o "\"browser_download_url\":[[:space:]]*\"[^\"]*${ASSET_NAME_PATTERN}\"" \
     | head -n1 \
-    | sed -E 's/.*"(https:[^"]+)"/\1/')"
+    | sed -E 's/.*"(https:[^"]+)"/\1/') || true )"
 
 if [[ -z "${DOWNLOAD_URL}" ]]; then
     echo "Ошибка: не удалось найти файл релиза для маски '${ASSET_NAME_PATTERN}'." >&2
@@ -221,6 +224,33 @@ fi
 
 echo "==> Файл для загрузки: ${DOWNLOAD_URL}"
 
+fetch_via_mirrors() {
+    local real_url="$1"
+    local out_file="$2"
+    local mirror label http_code size
+
+    for mirror in "${MIRRORS[@]}"; do
+        label="${mirror:-(прямое подключение)}"
+        echo "==> Пробую ${label} ..." >&2
+
+        http_code="$(curl -sSL "${CURL_OPTS[@]}" \
+            -w "%{http_code}" \
+            -o "${out_file}" \
+            "${mirror}${real_url}" 2>/dev/null || echo "000")"
+
+        size="$(stat -c%s "${out_file}" 2>/dev/null || echo 0)"
+
+        if [[ "${http_code}" == "200" && "${size}" -gt 1000000 ]]; then
+            echo "==> Успешно через ${label} (HTTP ${http_code}, ${size} байт)" >&2
+            return 0
+        else
+            echo "    Не удалось (HTTP ${http_code:-нет ответа}, размер ${size} байт)." >&2
+        fi
+    done
+
+    return 1
+}
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
@@ -228,9 +258,11 @@ TMP_GZ="${TMP_DIR}/${BIN_NAME}.gz"
 TMP_BIN="${TMP_DIR}/${BIN_NAME}"
 
 echo "==> Скачиваю бинарник..."
+DOWNLOAD_MIRRORS=("${MIRRORS[@]}")
 if [[ -n "${WORKING_MIRROR}" ]]; then
-    MIRRORS=("${WORKING_MIRROR}" "${MIRRORS[@]}")
+    DOWNLOAD_MIRRORS=("${WORKING_MIRROR}" "${MIRRORS[@]}")
 fi
+MIRRORS=("${DOWNLOAD_MIRRORS[@]}")
 
 if ! fetch_via_mirrors "${DOWNLOAD_URL}" "${TMP_GZ}"; then
     echo "Ошибка: не удалось скачать бинарник mihomo ни напрямую, ни через зеркала." >&2
@@ -286,11 +318,9 @@ systemctl daemon-reload
 systemctl enable mihomo
 systemctl restart mihomo || echo "Предупреждение: mihomo не запустился, проверьте конфиг." >&2
 
-# ---------- Cron-задача ----------
 CRON_LINE="0 4 * * * curl -s -L -A \"${USER_AGENT}\" \"${SUBSCRIPTION_URL}\" -o ${CONFIG_FILE} && sleep 3 && systemctl restart mihomo ${CRON_COMMENT}"
 
 echo "==> Настраиваю cron-задачу обновления подписки..."
-# Убираем старую задачу mihomo (если есть) и добавляем новую
 ( crontab -l 2>/dev/null | grep -v "${CRON_COMMENT}" ; echo "${CRON_LINE}" ) | crontab -
 
 echo
