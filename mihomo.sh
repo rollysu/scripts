@@ -137,8 +137,18 @@ esac
 echo "==> Обнаружена архитектура: ${ARCH_RAW} -> ${ARCH}"
 
 echo "==> Запрашиваю информацию о последнем релизе ${REPO}..."
-RELEASE_JSON="$(curl -fsSL -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/releases/latest")"
+
+# Скачиваем без -f, чтобы перехватить ответ, и предотвращаем аварийное завершение set -e
+RELEASE_JSON="$(curl -sSL -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${REPO}/releases/latest" || true)"
+
+# Проверяем, содержатся ли в ответе данные или сообщение об ошибке
+if echo "${RELEASE_JSON}" | grep -q "message"; then
+    ERR_MSG="$(echo "${RELEASE_JSON}" | grep -o '"message":\s*"[^"]*"' | head -n1)"
+    echo "Ошибка GitHub API: ${ERR_MSG:-Неизвестная ошибка}" >&2
+    echo "Возможно, превышен лимит запросов (Rate Limit). Подождите несколько минут или укажите версию вручную." >&2
+    exit 1
+fi
 
 TAG_NAME="$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')"
 
