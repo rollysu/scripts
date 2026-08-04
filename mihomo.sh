@@ -170,9 +170,6 @@ fetch_release_json() {
     tmp_file="$(mktemp)"
 
     for mirror in "${MIRRORS[@]}"; do
-        label="${mirror:-(прямое подключение)}"
-        echo "==> Пробую ${label} ..." >&2
-
         http_code="$(curl -sSL "${CURL_OPTS[@]}" \
             -H "Accept: application/vnd.github+json" \
             -w "%{http_code}" \
@@ -181,24 +178,19 @@ fetch_release_json() {
 
         if [[ "${http_code}" == "200" ]] && grep -q '"tag_name"' "${tmp_file}" 2>/dev/null; then
             WORKING_MIRROR="${mirror}"
-            echo "==> Успешно через ${label} (HTTP ${http_code})" >&2
             cat "${tmp_file}"
             rm -f "${tmp_file}"
             return 0
         fi
-
-        if [[ "${http_code}" == "200" ]]; then
-            echo "    HTTP 200, но это не похоже на релиз GitHub (нет tag_name)." >&2
-        else
-            echo "    Не удалось (HTTP ${http_code:-нет ответа})." >&2
-        fi
-        echo "    Начало ответа: $(head -c 150 "${tmp_file}" 2>/dev/null | tr -d '\n\r')" >&2
-
-        if grep -q '"message"' "${tmp_file}" 2>/dev/null; then
-            ERR_MSG="$(grep -o '"message":[[:space:]]*"[^"]*"' "${tmp_file}" | head -n1 || true)"
-            echo "    Ответ GitHub API: ${ERR_MSG:-см. выше}" >&2
-        fi
     done
+
+    label="${mirror:-(прямое подключение)}"
+    echo "    Последняя попытка (${label}): HTTP ${http_code:-нет ответа}." >&2
+    echo "    Начало ответа: $(head -c 150 "${tmp_file}" 2>/dev/null | tr -d '\n\r')" >&2
+    if grep -q '"message"' "${tmp_file}" 2>/dev/null; then
+        ERR_MSG="$(grep -o '"message":[[:space:]]*"[^"]*"' "${tmp_file}" | head -n1 || true)"
+        echo "    Ответ GitHub API: ${ERR_MSG:-см. выше}" >&2
+    fi
 
     rm -f "${tmp_file}"
     return 1
@@ -248,9 +240,6 @@ fetch_via_mirrors() {
     local mirror label http_code size
 
     for mirror in "${MIRRORS[@]}"; do
-        label="${mirror:-(прямое подключение)}"
-        echo "==> Пробую ${label} ..." >&2
-
         http_code="$(curl -sSL "${CURL_OPTS[@]}" \
             -w "%{http_code}" \
             -o "${out_file}" \
@@ -259,13 +248,12 @@ fetch_via_mirrors() {
         size="$(stat -c%s "${out_file}" 2>/dev/null || echo 0)"
 
         if [[ "${http_code}" == "200" && "${size}" -gt 1000000 ]]; then
-            echo "==> Успешно через ${label} (HTTP ${http_code}, ${size} байт)" >&2
             return 0
-        else
-            echo "    Не удалось (HTTP ${http_code:-нет ответа}, размер ${size} байт)." >&2
         fi
     done
 
+    label="${mirror:-(прямое подключение)}"
+    echo "    Последняя попытка (${label}): HTTP ${http_code:-нет ответа}, размер ${size:-0} байт." >&2
     return 1
 }
 
@@ -336,7 +324,6 @@ systemctl daemon-reload
 systemctl enable mihomo
 systemctl restart mihomo || echo "Предупреждение: mihomo не запустился, проверьте конфиг." >&2
 
-# ---------- Cron-задача ----------
 CRON_LINE="0 4 * * * curl -s -L -A \"${USER_AGENT}\" \"${SUBSCRIPTION_URL}\" -o ${CONFIG_FILE} && sleep 3 && systemctl restart mihomo ${CRON_COMMENT}"
 
 echo "==> Настраиваю cron-задачу обновления подписки..."
