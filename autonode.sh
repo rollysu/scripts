@@ -30,6 +30,12 @@ save_var() {
     printf '%s=%q\n' "$name" "$value" >> "$VARS_FILE"
 }
 
+scrub_var() {
+    local name="$1"
+    sed -i "/^${name}=/d" "$VARS_FILE" 2>/dev/null || true
+    unset "$name" 2>/dev/null || true
+}
+
 is_step_done() {
     grep -qxF "$1" "$STATE_FILE"
 }
@@ -316,6 +322,8 @@ step_remnanode() {
     while [ "$tries" -lt 10 ]; do
         if docker ps --format '{{.Names}}' | grep -qi remnanode; then
             echo "✔️  Контейнер remnanode запущен."
+            scrub_var "KEY"
+            scrub_var "NODE_KEY_ENTERED"
             return 0
         fi
         tries=$((tries + 1))
@@ -356,7 +364,7 @@ step_ssl() {
 
         local NODE_COMPOSE="/opt/remnanode/docker-compose.yml"
         local CERT_HOST_PATH="/opt/caddy/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
- 
+
         if [ -f "$NODE_COMPOSE" ]; then
             if ! grep -q "acme-v02.api.letsencrypt.org" "$NODE_COMPOSE"; then
                 cp "$NODE_COMPOSE" "$NODE_COMPOSE.bak"
@@ -374,7 +382,7 @@ step_ssl() {
                         print
                     }
                 ' "$NODE_COMPOSE" > "$NODE_COMPOSE.tmp"
- 
+
                 if grep -q "$CERT_HOST_PATH" "$NODE_COMPOSE.tmp"; then
                     mv "$NODE_COMPOSE.tmp" "$NODE_COMPOSE"
                     echo "Файл $NODE_COMPOSE успешно обновлен."
