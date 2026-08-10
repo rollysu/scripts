@@ -248,8 +248,8 @@ step_ufw() {
     fi
 
     if [ -z "${PANEL_PORT:-}" ]; then
-        read -p "Введите порт панели управления [по умолчанию 3000]: " PANEL_PORT
-        PANEL_PORT=${PANEL_PORT:-3000}
+        read -p "Введите порт панели управления [по умолчанию 2222]: " PANEL_PORT
+        PANEL_PORT=${PANEL_PORT:-2222}
         until validate_port "$PANEL_PORT"; do
             read -p "Некорректный порт. Введите порт панели еще раз: " PANEL_PORT
         done
