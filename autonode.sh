@@ -355,12 +355,36 @@ step_ssl() {
         fi
 
         local NODE_COMPOSE="/opt/remnanode/docker-compose.yml"
+        local CERT_HOST_PATH="/opt/caddy/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
+ 
         if [ -f "$NODE_COMPOSE" ]; then
             if ! grep -q "acme-v02.api.letsencrypt.org" "$NODE_COMPOSE"; then
-                sed -i '0,/volumes:/ s|volumes:|volumes:\n      - /opt/caddy/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory:/etc/xray/certs:ro|' "$NODE_COMPOSE"
-                echo "Файл $NODE_COMPOSE успешно обновлен."
-                cd /opt/remnanode && docker compose down && docker compose up -d
-                cd - > /dev/null
+                cp "$NODE_COMPOSE" "$NODE_COMPOSE.bak"
+                awk -v certpath="$CERT_HOST_PATH" '
+                    BEGIN { done = 0 }
+                    {
+                        if (!done && $0 ~ /^[[:space:]]*#?[[:space:]]*volumes:[[:space:]]*$/) {
+                            match($0, /^[[:space:]]*/)
+                            indent = substr($0, RSTART, RLENGTH)
+                            print indent "volumes:"
+                            print indent "  - " certpath ":/etc/xray/certs:ro"
+                            done = 1
+                            next
+                        }
+                        print
+                    }
+                ' "$NODE_COMPOSE" > "$NODE_COMPOSE.tmp"
+ 
+                if grep -q "$CERT_HOST_PATH" "$NODE_COMPOSE.tmp"; then
+                    mv "$NODE_COMPOSE.tmp" "$NODE_COMPOSE"
+                    echo "Файл $NODE_COMPOSE успешно обновлен."
+                    cd /opt/remnanode && docker compose down && docker compose up -d
+                    cd - > /dev/null
+                else
+                    rm -f "$NODE_COMPOSE.tmp"
+                    echo "⚠️ Не найдена секция 'volumes:' (даже закомментированная) в $NODE_COMPOSE."
+                    echo "   Добавьте вручную том: ${CERT_HOST_PATH}:/etc/xray/certs:ro"
+                fi
             else
                 echo "Сертификаты уже примонтированы в $NODE_COMPOSE."
             fi
